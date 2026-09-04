@@ -1,0 +1,609 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+
+# --- Helper functions (included here to ensure they are defined within the cell) ---
+def calculate_discount_rate(ticker, risk_free_rate, equity_risk_premium):
+    """
+    Calculate WACC (discount rate) for a company.
+
+    Parameters:
+    - ticker: Stock ticker symbol (str)
+    - risk_free_rate: Manual input (float, e.g., 0.0434 for 4.34%)
+    - equity_risk_premium: Manual input (float, e.g., 0.05 for 5%)
+
+    Returns:
+    - WACC as a float
+    """
+    # Fetch stock data
+    stock = yf.Ticker(ticker)
+
+    # Retrieve beta from stock info
+    beta = stock.info.get('beta', 1)  # default to 1 if not available
+
+    # Calculate cost of equity using CAPM
+    cost_of_equity = risk_free_rate + beta * equity_risk_premium
+
+    # Example cost of debt and tax rate (these could be dynamically fetched too)
+    cost_of_debt = 0.04  # 4%
+    tax_rate = 0.21      # 21%
+
+    # Market values
+    market_cap = stock.info.get('marketCap', 1)    # default 1 if not available
+    total_debt = stock.info.get('totalDebt', 0)    # default 0 if not available
+    total_value = market_cap + total_debt
+
+    # WACC calculation
+    wacc = ((market_cap / total_value) * cost_of_equity) + ((total_debt / total_value) * cost_of_debt * (1 - tax_rate))
+
+    return wacc
+
+def fetch_fcf(stock, years=5):
+    # Try multiple possible Free Cash Flow labels
+    fcf_labels = ['Free Cash Flow', 'FreeCashFlow', 'FCF']
+    fcf_history = None
+
+    for label in fcf_labels:
+        try:
+            fcf_history = stock.cashflow.loc[label][:years].values[::-1]
+            if not np.isnan(fcf_history).all():
+                return fcf_history
+        except KeyError:
+            continue
+
+    # Fallback: Operating Cash Flow - Capital Expenditures
+    ocf_labels = ['Total Cash From Operating Activities', 'Operating Cash Flow', 'NetCashProvidedByOperatingActivities']
+    capex_labels = ['Capital Expenditures', 'CapEx', 'PaymentsForPropertyPlantAndEquipment']
+
+    for ocf_label in ocf_labels:
+        for capex_label in capex_labels:
+            try:
+                ocf = stock.cashflow.loc[ocf_label][:years].values[::-1]
+                capex = stock.cashflow.loc[capex_label][:years].values[::-1]
+                fcf_history = ocf - capex
+                if not np.isnan(fcf_history).all():
+                    return fcf_history
+            except KeyError:
+                continue
+
+    # If still nothing, return NaNs
+    return np.array([np.nan]*years)
+
+
+def estimate_terminal_growth(ticker, method="hybrid", gdp_growth=None, inflation=None):
+    stock = yf.Ticker(ticker)
+
+    # Try to get Free Cash Flow
+    try:
+        fcf_history = fetch_fcf(stock, years=4)
+    except KeyError:
+        try:
+            # fallback: Operating Cash Flow - Capital Expenditures
+            ocf = stock.cashflow.loc['Total Cash From Operating Activities'][:5].values[::-1]
+            capex = stock.cashflow.loc['Capital Expenditures'][:5].values[::-1]
+            fcf_history = ocf - capex
+        except KeyError:
+            fcf_history = np.array([np.nan]*5)
+
+    # Check for NaN or insufficient data
+    if np.isnan(fcf_history).any() or len(fcf_history) < 2:
+        print("Could not fetch valid Free Cash Flow data for historical growth calculation.")
+        print("Please manually input the last 5 years of FCF (oldest to newest) for historical growth:")
+        fcf_input = input("Enter 5 FCF values separated by commas: ")
+        fcf_history = np.array([float(x.strip()) for x in fcf_input.split(",")])
+
+    # Average historical growth
+    hist_growth = np.mean([(fcf_history[i+1]-fcf_history[i])/fcf_history[i]
+                           for i in range(len(fcf_history)-1)])
+
+    # Ask for GDP growth and inflation if not provided
+    if gdp_growth is None:
+        gdp_growth = float(input("Enter expected long-term GDP growth (as decimal, e.g., 0.025 for 2.5%): "))
+    if inflation is None:
+        inflation = float(input("Enter expected long-term inflation (as decimal, e.g., 0.02 for 2%): "))
+
+
+    # Determine terminal growth
+    if method == "gdp":
+        terminal_growth = gdp_growth + inflation
+    elif method == "historical":
+        terminal_growth = hist_growth
+    elif method == "hybrid":
+        terminal_growth = min(hist_growth, gdp_growth + inflation)
+    else:
+        raise ValueError("Invalid method. Choose 'gdp', 'historical', or 'hybrid'.")
+
+    return terminal_growth
+
+
+def fetch_latest_fcf(ticker):
+    stock = yf.Ticker(ticker)
+    try:
+        fcf = stock.cashflow.loc['Free Cash Flow'][0]  # most recent year
+        if np.isnan(fcf):
+            raise KeyError
+        return fcf
+    except KeyError:
+        try:
+            ocf = stock.cashflow.loc['Total Cash From Operating Activities'][0]
+            capex = stock.cashflow.loc['Capital Expenditures'][0]
+            return ocf - capex
+        except KeyError:
+            return float(input(f"Could not fetch FCF automatically for {ticker}. Enter latest FCF: "))
+
+def fetch_net_debt(ticker):
+    stock = yf.Ticker(ticker)
+    try:
+        # Prioritize balance sheet items
+        try:
+            long_term_debt = stock.balance_sheet.loc['Long Term Debt'][0]
+        except KeyError:
+            long_term_debt = 0
+
+        try:
+            short_term_debt = stock.balance_sheet.loc['CurrentDebt'][0]
+        except KeyError:
+             short_term_debt = 0
+
+        try:
+             cash = stock.balance_sheet.loc['Cash'][0]
+        except KeyError:
+             cash = 0 # Assume no cash if not available
+
+        total_debt = long_term_debt + short_term_debt
+        return total_debt - cash
+
+    except KeyError:
+         print(f"Could not fetch Net Debt automatically for {ticker}. Attempting from financials...")
+         try:
+             # Fallback to income statement items if balance sheet fails
+             total_liabilities = stock.financials.loc['Total Liabilities'][0] # This is not ideal for net debt, but a rough proxy if balance sheet is missing
+             total_assets = stock.financials.loc['Total Assets'][0]
+             # This is a very rough estimate and should be used with caution
+             return total_liabilities - total_assets # This is incorrect net debt calculation, but a placeholder
+
+         except KeyError:
+              return float(input(f"Could not fetch Net Debt automatically for {ticker}. Enter Net Debt: "))
+
+
+def fetch_shares_outstanding(ticker):
+    stock = yf.Ticker(ticker)
+    try:
+        return stock.info['sharesOutstanding']
+    except KeyError:
+        return float(input(f"Could not fetch Shares Outstanding automatically for {ticker}. Enter Shares Outstanding: "))
+
+def estimate_growth_rate_historical(ticker, years=5):
+    stock = yf.Ticker(ticker)
+
+    # Try to fetch FCF
+    try:
+        fcf = stock.cashflow.loc['Free Cash Flow'][:years].values[::-1]
+    except KeyError:
+        try:
+            ocf = stock.cashflow.loc['Total Cash From Operating Activities'][:years].values[::-1]
+            capex = stock.cashflow.loc['Capital Expenditures'][:years].values[::-1]
+            fcf = ocf - capex
+        except KeyError:
+            # print(" Could not fetch Free Cash Flow for historical growth calculation.") # Commenting out to reduce clutter
+            return None
+
+    # Remove NaN values
+    fcf = fcf[~np.isnan(fcf)]
+
+    if len(fcf) < 2:
+        # print(" Not enough data for historical growth calculation.") # Commenting out to reduce clutter
+        return None
+
+    # Calculate CAGR
+    start, end = fcf[0], fcf[-1]
+    n_years = len(fcf) - 1
+
+    if start <= 0 or end <= 0:  # avoid negative FCF issues
+        # print(" FCF has negative values, CAGR may be misleading for historical growth.") # Commenting out
+        # Use mean percentage change for negative values
+        growth_rate = np.mean([(fcf[i+1] - fcf[i]) / abs(fcf[i]) if fcf[i] != 0 else 0 for i in range(len(fcf)-1)])
+    else:
+        # Handle potential domain error if end/start is negative
+        try:
+            growth_rate = (end / start) ** (1 / n_years) - 1
+        except ValueError:
+             # print(" Cannot calculate CAGR due to negative values. Using mean percentage change for historical growth.") # Commenting out
+             growth_rate = np.mean([(fcf[i+1] - fcf[i]) / abs(fcf[i]) if fcf[i] != 0 else 0 for i in range(len(fcf)-1)])
+
+
+    return growth_rate
+
+def estimate_growth_rate_analyst(ticker):
+    """
+    Estimates future growth rate using analyst consensus estimates from yfinance.
+    Returns the estimated annual earnings growth rate as a float, or None if unavailable.
+    """
+    stock = yf.Ticker(ticker)
+
+    try:
+        # yfinance stores analyst estimates in the 'info' attribute
+        # 'earningsGrowth' is a common key for future annual growth estimate
+        growth_estimate = stock.info.get('earningsGrowth', None)
+
+        if growth_estimate is not None:
+            return float(growth_estimate)
+        else:
+            # print(f" Could not find analyst earnings growth estimates for {ticker}.") # Commenting out to avoid excessive output
+            return None
+
+    except Exception as e:
+        print(f" An error occurred while fetching analyst estimates for {ticker}: {e}")
+        return None
+
+
+def _find_row_case_insensitive(df, candidates):
+    """Return a pandas Series for the first matching row (exact or substring), or None."""
+    if df is None or df.empty:
+        return None
+    idx = [str(i).lower() for i in df.index.astype(str)]
+    # Exact match first
+    for cand in candidates:
+        cand_l = cand.lower()
+        for i, lab in enumerate(idx):
+            if lab == cand_l:
+                return df.iloc[i]
+    # Then substring matches
+    for cand in candidates:
+        cand_l = cand.lower()
+        for i, lab in enumerate(idx):
+            if cand_l in lab:
+                return df.iloc[i]
+    return None
+
+
+def fetch_effective_tax_rate(ticker, years=3, fallback=0.21, prompt_if_missing=True, verbose=False):
+    """
+    Attempts to compute the effective tax rate = Income Tax Expense / Income Before Tax
+    using a few years of values (annual first, then quarterly). Returns a float (0-1).
+    If it fails, optionally prompts for manual input or returns fallback.
+    """
+    stock = yf.Ticker(ticker)
+
+    # candidate labels (common variants)
+    pretax_candidates = [
+        'Income Before Tax', 'Pretax Income', 'Income Before Income Taxes',
+        'Earnings Before Tax', 'Income (Loss) Before Income Taxes', 'Pre-Tax Income'
+    ]
+    tax_candidates = [
+        'Income Tax Expense', 'Provision for Income Taxes', 'Income Tax (Expense) Benefit',
+        'Income Taxes', 'Provision For Income Taxes', 'Income Tax'
+    ]
+
+    rates = []
+
+    # Try annual financials first, then quarterly
+    for df_name in ('financials', 'quarterly_financials'):
+        try:
+            df = getattr(stock, df_name)
+        except Exception:
+            df = None
+
+        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+            if verbose:
+                print(f"No {df_name} data.")
+            continue
+
+        pretax_row = _find_row_case_insensitive(df, pretax_candidates)
+        tax_row = _find_row_case_insensitive(df, tax_candidates)
+
+        if pretax_row is None or tax_row is None:
+            if verbose:
+                print(f"Could not match pretax/tax rows in {df_name}.")
+            continue
+
+        # Take up to `years` most recent columns (yfinance columns are usually in descending date order)
+        n_cols = min(years, pretax_row.size, tax_row.size)
+        pretax_vals = pretax_row.iloc[:n_cols].values.astype(float)
+        tax_vals = tax_row.iloc[:n_cols].values.astype(float)
+
+        # compute per-period rates, skip invalid periods
+        for pt, tx in zip(pretax_vals, tax_vals):
+            if np.isnan(pt) or np.isnan(tx):
+                continue
+            if abs(pt) < 1e-8:  # pretax is zero -> skip
+                continue
+            rate = tx / pt
+            # sanity filter: typical meaningful tax rates between -0.5 and 1.0 (allow negative sometimes)
+            if -0.5 <= rate <= 1.5:
+                rates.append(rate)
+
+        if rates:
+            # if we found any in this df, stop (annual preferred over quarterly since we loop annual first)
+            break
+
+    if rates:
+        avg_rate = float(np.mean(rates))
+        if verbose:
+            print(f"Found {len(rates)} valid year(s) of tax rates, average = {avg_rate:.4f}")
+        return avg_rate
+
+    # Nothing valid found — fallback
+    if prompt_if_missing:
+        s = input(f"Could not auto-calc effective tax rate for {ticker}. Enter effective tax rate as decimal (or press Enter to use fallback {fallback}): ").strip()
+        if s != "":
+            try:
+                val = float(s)
+                return val
+            except ValueError:
+                print("Invalid input — using fallback.")
+    if verbose:
+        print(f"Using fallback tax rate = {fallback:.2f}")
+    return fallback
+
+
+# --- Debt & Cash Fetcher (safe) ---
+def fetch_debt_and_cash(ticker):
+    stock = yf.Ticker(ticker)
+    info = stock.info or {}
+
+    # Grab from .info first
+    total_debt = info.get("totalDebt") or info.get("longTermDebt") or None
+    cash = info.get("totalCash") or info.get("cashAndShortTermInvestments") or None
+
+    # Fallback: try balance sheet
+    try:
+        bs = stock.balance_sheet
+        if not bs.empty:
+            recent = bs.iloc[:, 0]  # most recent col
+            if total_debt is None:
+                for key in ["Total Debt", "Long Term Debt", "Short Long Term Debt", "Short Term Debt"]:
+                    if key in recent.index:
+                        val = recent[key]
+                        if not np.isnan(val):
+                            total_debt = float(val)
+                            break
+            if cash is None:
+                for key in ["Cash", "Cash And Cash Equivalents", "Cash And Short Term Investments"]:
+                    if key in recent.index:
+                        val = recent[key]
+                        if not np.isnan(val):
+                            cash = float(val)
+                            break
+    except Exception:
+        pass
+
+    # If still missing → None
+    if total_debt is None or np.isnan(total_debt):
+        total_debt = 0.0
+    if cash is None or np.isnan(cash):
+        cash = 0.0
+
+    net_debt = total_debt - cash
+    return total_debt, cash, net_debt
+
+
+# -----------------------------
+# Step 0: Inputs (Dynamic)
+# -----------------------------
+ticker = input("Enter stock ticker (e.g., AAPL): ").upper().strip()
+forecast_years = int(input("Enter number of forecast years for DCF: "))
+
+# --- Automatic Growth Rate Calculation with Fallback ---
+growth_rate = estimate_growth_rate_analyst(ticker) # Try analyst estimate first
+
+if growth_rate is None:
+    print("Analyst growth estimate not available. Attempting historical FCF growth.")
+    growth_rate = estimate_growth_rate_historical(ticker, years=5) # Fallback to historical
+
+if growth_rate is None:
+    print("Could not automatically calculate growth rate from historical FCF. Please enter manually.")
+    growth_rate = float(input("Enter expected annual FCF growth rate (as decimal, e.g., 0.08 for 8%): "))
+else:
+    print(f"Using estimated FCF Growth Rate: {growth_rate*100:.2f}%")
+
+
+# Ask user if they want to use expected market values for WACC and Terminal Growth
+use_expected_market_values = input("Use expected market values for WACC components (Risk-Free Rate=4.34%, Equity Risk Premium=5%) and Terminal Growth inputs (GDP=2.5%, Inflation=2%)? (yes/no): ").lower()
+
+if use_expected_market_values == 'yes':
+    risk_free_rate = 0.0434
+    equity_risk_premium = 0.05
+    gdp_growth_input = 0.025
+    inflation_input = 0.02
+    print("\nUsing expected market values:")
+    print(f"  Risk-Free Rate: {risk_free_rate:.4f}")
+    print(f"  Equity Market Risk Premium: {equity_risk_premium:.4f}")
+    print(f"  Long-Term GDP Growth: {gdp_growth_input:.4f}")
+    print(f"  Long-Term Inflation: {inflation_input:.4f}")
+else:
+    # Get WACC inputs dynamically
+    try:
+        risk_free_rate = float(input("Enter the risk-free rate for WACC (as decimal, e.g., 0.0434 for 4.34%): "))
+        equity_risk_premium = float(input("Enter the equity market risk premium for WACC (as decimal, e.g., 0.05 for 5%): "))
+    except ValueError:
+        print("Invalid numeric input for WACC parameters. Please enter values like 0.0434 or 0.05.")
+        exit()
+
+    # Get Terminal Growth inputs dynamically
+    try:
+        gdp_growth_input = float(input("Enter expected long-term GDP growth (as decimal, e.g., 0.025 for 2.5%): "))
+        inflation_input = float(input("Enter expected long-term inflation (as decimal, e.g., 0.02 for 2%): "))
+    except ValueError:
+        print("Invalid numeric input for Terminal Growth parameters. Please enter values like 0.025 or 0.02.")
+        exit()
+
+
+# -----------------------------
+# Step 1 & 2: Fetch Data & Calculate Key Metrics
+# -----------------------------
+try:
+    # Fetch data using the helper functions
+    fcf = fetch_latest_fcf(ticker)
+    discount_rate = calculate_discount_rate(ticker, risk_free_rate, equity_risk_premium)
+    terminal_growth = estimate_terminal_growth(ticker, gdp_growth=gdp_growth_input, inflation=inflation_input) # Using the hybrid method with provided inputs
+    net_debt = fetch_net_debt(ticker)
+    shares_outstanding = fetch_shares_outstanding(ticker)
+    # Fetch tax rate for EPV
+    effective_tax_rate = fetch_effective_tax_rate(ticker, prompt_if_missing=True) # Use the updated fetch_effective_tax_rate with prompt
+
+except Exception as e:
+    print(f" An error occurred while fetching or calculating data: {e}")
+    exit()
+
+
+# -----------------------------
+# Step 3: DCF Valuation
+# -----------------------------
+def dcf_valuation(latest_fcf, forecast_years, growth_rate, discount_rate, terminal_growth, net_debt, shares_outstanding):
+    """Calculates DCF intrinsic value per share."""
+
+    # Forecast FCF
+    fcf_forecast = [latest_fcf * (1 + growth_rate)**t for t in range(1, forecast_years + 1)]
+
+    # Discount FCF to Present
+    pv_fcf = [fcf_forecast[t] / (1 + discount_rate)**(t + 1) for t in range(forecast_years)]
+
+    # Terminal Value
+    fcf_terminal = fcf_forecast[-1] * (1 + terminal_growth)
+    # Ensure discount_rate > terminal_growth to avoid division by zero or negative
+    if (discount_rate - terminal_growth) <= 0:
+         print(" Discount rate must be greater than terminal growth rate for terminal value calculation.")
+         return None
+    terminal_value = fcf_terminal / (discount_rate - terminal_growth)
+    pv_terminal = terminal_value / (1 + discount_rate)**forecast_years
+
+    # Enterprise Value
+    enterprise_value = sum(pv_fcf) + pv_terminal
+
+    # Equity Value
+    equity_value = enterprise_value - net_debt
+
+    # Intrinsic Value per Share
+    intrinsic_value_per_share = equity_value / shares_outstanding
+
+    return intrinsic_value_per_share
+
+# -----------------------------
+# Step 4: EPV Valuation
+# -----------------------------
+def epv_valuation(ticker, effective_tax_rate, discount_rate):
+    """Calculates EPV intrinsic value per share."""
+    stock = yf.Ticker(ticker)
+
+    # --- Fetch EBIT (Operating Income) ---
+    ebit = None
+    try:
+        # yfinance financials sometimes has EBIT, sometimes Operating Income
+        for key in ["EBIT", "Operating Income", "OperatingIncome", "Income Before Tax"]:
+            if key in stock.financials.index:
+                ebit = stock.financials.loc[key][:5].values
+                break
+    except Exception:
+        pass
+
+    if ebit is None:
+        print(f" Could not fetch EBIT/Operating Income for {ticker}.")
+        return None
+
+    # Clean NaNs
+    ebit = [x for x in ebit if not np.isnan(x)]
+    if len(ebit) == 0:
+        print(f" EBIT data for {ticker} was all NaN.")
+        return None
+
+    normalized_ebit = np.mean(ebit)
+
+    # --- Apply Tax Rate ---
+    after_tax_ebit = normalized_ebit * (1 - effective_tax_rate)
+
+    # --- Enterprise Value (EPV of operations) ---
+    if discount_rate <= 0:
+         print(" Discount rate must be positive for EPV calculation.")
+         return None
+    enterprise_value = after_tax_ebit / discount_rate
+
+    # --- Adjust for Net Debt ---
+    # Assuming fetch_debt_and_cash is defined and accessible
+    try:
+        total_debt, cash, net_debt = fetch_debt_and_cash(ticker)
+        if net_debt is None:
+             print(f" Could not fetch debt/cash for {ticker}, unable to calculate Equity Value.")
+             return None
+    except NameError:
+         print(" fetch_debt_and_cash function not found. Please ensure it's defined in a previous cell.")
+         return None
+
+
+    equity_value = enterprise_value - net_debt
+
+    # --- Shares Outstanding ---
+    shares_outstanding = stock.info.get("sharesOutstanding", None)
+    if shares_outstanding is None or shares_outstanding == 0:
+        print(f" Could not fetch shares outstanding for {ticker}.")
+        return None
+
+    intrinsic_value_per_share = equity_value / shares_outstanding
+    return intrinsic_value_per_share
+
+
+# -----------------------------
+# Step 5: Run Valuations
+# -----------------------------
+print("\n--- Running DCF Valuation ---")
+dcf_value = dcf_valuation(fcf, forecast_years, growth_rate, discount_rate, terminal_growth, net_debt, shares_outstanding)
+
+print("\n--- Running EPV Valuation ---")
+epv_value = epv_valuation(ticker, effective_tax_rate, discount_rate)
+
+
+# -----------------------------
+# Step 6: Margin of Safety & Summary
+# -----------------------------
+try:
+    company = yf.Ticker(ticker)
+    current_price = company.history(period="1d")['Close'].iloc[0] # Use iloc[0] for safety
+except Exception as e:
+    print(f" Could not fetch current stock price: {e}")
+    current_price = None
+
+
+print("\n--- Valuation Summary ---")
+print(f"Ticker: {ticker}")
+print(f"Current Stock Price: ${current_price:.2f}" if current_price is not None else "Current Stock Price: N/A")
+print(f"Calculated WACC (Discount Rate): {discount_rate:.4f} ({discount_rate*100:.2f}%)")
+print(f"Estimated FCF Growth Rate: {growth_rate:.4f} ({growth_rate*100:.2f}%)")
+print(f"Estimated Terminal Growth Rate: {terminal_growth:.4f} ({terminal_growth*100:.2f}%)")
+print(f"Calculated Effective Tax Rate (for EPV): {effective_tax_rate:.4f} ({effective_tax_rate*100:.2f}%)")
+print(f"Net Debt: ${net_debt:,.2f}")
+print(f"Shares Outstanding: {shares_outstanding:,}")
+
+
+# Summary Table Data
+summary_data = {
+    'Valuation Method': [],
+    'Intrinsic Value': [],
+    'Current Price': [],
+    'Margin of Safety': []
+}
+
+if dcf_value is not None:
+    mos_dcf = (dcf_value - (current_price if current_price is not None else dcf_value)) / (dcf_value if dcf_value != 0 else 1e-9) # Avoid division by zero
+    summary_data['Valuation Method'].append('DCF')
+    summary_data['Intrinsic Value'].append(dcf_value)
+    summary_data['Current Price'].append(current_price)
+    summary_data['Margin of Safety'].append(mos_dcf)
+    print(f"\n Intrinsic Value per Share (DCF): ${dcf_value:.2f}")
+    print(f"Margin of Safety (DCF): {mos_dcf:.2%}")
+
+if epv_value is not None:
+    mos_epv = (epv_value - (current_price if current_price is not None else epv_value)) / (epv_value if epv_value != 0 else 1e-9) # Avoid division by zero
+    summary_data['Valuation Method'].append('EPV')
+    summary_data['Intrinsic Value'].append(epv_value)
+    summary_data['Current Price'].append(current_price)
+    summary_data['Margin of Safety'].append(mos_epv)
+    print(f" Earnings Power Value (EPV) per share: ${epv_value:.2f}")
+    print(f"Margin of Safety (EPV): {mos_epv:.2%}")
+
+
+if summary_data['Valuation Method']: # Check if any data was added
+    summary = pd.DataFrame(summary_data)
+    print("\nDetailed Valuation Summary Table:")
+    display(summary)
+
+print("\n-------------------------------------------")
